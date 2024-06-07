@@ -31,10 +31,16 @@ def generate_launch_description():
         'TODO',
         default_value='mav/base_link'
     )
+    (cfg_camera, arg_camera) = get_settable_arg(
+        'camera_name',
+        'TODO',
+        default_value='camera/color'
+    )
     
     return LaunchDescription([
         arg_parent,
         arg_child,
+        arg_camera,
         ComposableNodeContainer(
             name='processor_container',
             namespace='',
@@ -46,9 +52,13 @@ def generate_launch_description():
                     package='image_stabilizer_proc',
                     plugin='image_stabilizer_proc::Stabilizer',
                     name="stabilier",
+                    namespace=cfg_camera,
                     parameters=[
                         {"parent_frame": cfg_parent},
                         {"child_frame": cfg_child},
+                    ],
+                    remappings=[
+                        ('image', 'image_raw'),
                     ],
                     extra_arguments=[{'use_intra_process_comms': True}],
                 ),
