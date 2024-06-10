@@ -56,6 +56,8 @@ def generate_launch_description():
                     parameters=[
                         {"parent_frame": cfg_parent},
                         {"child_frame": cfg_child},
+                        {"stabilize_rotation": False},
+                        {"stabilize_translation": True},
                     ],
                     remappings=[
                         ('image', 'image_raw'),

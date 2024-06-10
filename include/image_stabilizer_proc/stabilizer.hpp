@@ -21,6 +21,12 @@ class Stabilizer : public rclcpp::Node
     std::string _parent_frame;
     std::string _child_frame;
     int64_t _sync_window;
+    //Enabling for stabilization
+    bool _stabilize_rotation;
+    bool _stabilize_translation;
+    //Time constants for "spring to center"
+    double _spring_tau_rotation;
+    double _spring_tau_translation;
 
     std::unique_ptr<tf2_ros::Buffer> _tf_buffer;
     std::shared_ptr<tf2_ros::TransformListener> _tf_listener;

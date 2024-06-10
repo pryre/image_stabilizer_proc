@@ -9,6 +9,7 @@
 #include <chrono>
 #include <tf2_eigen/tf2_eigen.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <opencv2/core/eigen.hpp>
 
 #include "image_stabilizer_proc/stabilizer.hpp"
 
@@ -26,6 +27,20 @@ double right_hand_angle(Eigen::Vector3d v1, Eigen::Vector3d v2, Eigen::Vector3d 
   const auto dot = v1.dot(v2);
   return atan2(det, dot);
 }
+
+cv::Mat chain_affine_transformation_mats(const cv::Mat& M0, const cv::Mat& M1) {
+  assert(M0.rows == 2 && M0.cols == 3);
+  assert(M1.rows == 2 && M1.cols == 3);
+
+  cv::Mat Mx = (cv::Mat_<double>(1,3) << 0, 0, 1);
+  cv::Mat M0_3, M1_3;
+  cv::vconcat(M0, Mx, M0_3);
+  cv::vconcat(M1, Mx, M1_3);
+  
+  //Multiply and drop the last row
+  const cv::Rect roi(0, 0, 3, 2);
+  return M0_3.mul(M1_3)(roi);
+}
 }
 
 Stabilizer::Stabilizer(const rclcpp::NodeOptions & options)
@@ -34,6 +49,10 @@ _ptr(rclcpp::Node::SharedPtr(this, [](auto *) {})),
 _parent_frame(this->declare_parameter<std::string>("parent_frame", "map")),
 _child_frame(this->declare_parameter<std::string>("child_frame", "base_link")),
 _sync_window(this->declare_parameter<int64_t>("sync_window", 50)),
+_stabilize_rotation(this->declare_parameter<bool>("stabilize_rotation", true)),
+_stabilize_translation(this->declare_parameter<bool>("stabilize_translation", true)),
+_spring_tau_rotation(this->declare_parameter<double>("spring_tau_rotation", 1.0)),
+_spring_tau_translation(this->declare_parameter<double>("spring_tau_translation", 1.0)),
 _tf_buffer(std::make_unique<tf2_ros::Buffer>(this->get_clock())),
 _tf_listener(std::make_shared<tf2_ros::TransformListener>(*_tf_buffer)),
 // _it(_ptr),
@@ -57,7 +76,14 @@ void Stabilizer::_cb_camera(const image_transport::ImageTransport::ImageConstPtr
     return;
   }
 
-  // RCLCPP_INFO_STREAM(this->get_logger(), "Camera message received");
+  // Update the camera model
+  _model.fromCameraInfo(info);
+
+  //Short-cut early if stabilization is disabled
+  if(!_stabilize_rotation && !_stabilize_translation) {
+    _proc_out.publish(image);
+    return;
+  }
 
   geometry_msgs::msg::TransformStamped t;
   try {
@@ -99,23 +125,55 @@ void Stabilizer::_cb_camera(const image_transport::ImageTransport::ImageConstPtr
   Eigen::Matrix3d R_t;
   R_t << R_c.col(0), y_t, z_t;
 
-  //Calculate the "roll" angle between the two 'y' vectors
-  //TODO: this will probably need to be ajusted if 'y' is not used above
-  // const auto q_r = Eigen::Quaterniond::FromTwoVectors(y_t, R_c.col(1));
-  // const Eigen::AngleAxisd a_r(q_r);
-  const auto a_r = right_hand_angle(y_t, R_c.col(1), R_c.col(0));
-  // RCLCPP_INFO_STREAM(this->get_logger(), "a_r: " << a_r);
+  auto correction_angle = 0.0;
+  const auto center = cv::Point( cv_ptr->image.cols/2, cv_ptr->image.rows/2 );
+  if(_stabilize_rotation) {
+    //Calculate the "roll" angle between the two 'y' vectors
+    //TODO: this will probably need to be ajusted if 'y' is not used above
+    // const auto q_r = Eigen::Quaterniond::FromTwoVectors(y_t, R_c.col(1));
+    // const Eigen::AngleAxisd a_r(q_r);
+    const auto a_r = right_hand_angle(y_t, R_c.col(1), R_c.col(0));
+    // RCLCPP_INFO_STREAM(this->get_logger(), "a_r: " << a_r);
+
+    correction_angle = -180.0*a_r/M_PI; //Rotation angle is measured clockwise around axis, cv takes positive angle as anticlockwise
+  }
+  //Get the rotational warp affine
+  const auto Mr = cv::getRotationMatrix2D( center, correction_angle, 1.0 );
 
 
-  // Update the camera model
-  _model.fromCameraInfo(info);
+  //Get the translation warp affine
+  double correction_x = 0.0;
+  double correction_y = 0.0;
+  if(_stabilize_translation) {
+    // const auto center
+    double fov_xd, fov_yd, focal_length, aspect_ratio;
+    cv::Point2d principle;
+    cv::calibrationMatrixValues(_model.intrinsicMatrix(), cv_ptr->image.size(), 0, 0, fov_xd, fov_yd, focal_length, principle, aspect_ratio);
+    // RCLCPP_INFO_STREAM(this->get_logger(), "fov_xd: " << fov_xd << "; fov_yd: " << fov_yd);
 
+    //Get ratio of angle per pixel
+    const auto a_px = (M_PI*fov_xd/180.0) / cv_ptr->image.cols;
+    const auto a_py = (M_PI*fov_yd/180.0) / cv_ptr->image.rows;
+
+    //Angle between the X axis and the center of image
+    const auto axc = right_hand_angle(Eigen::Vector3d::UnitY(), y_t, Eigen::Vector3d::UnitZ());
+    //Normalized Y offset is the same as the rotation X-vector in the Z-axis
+    const auto ayc = right_hand_angle(Eigen::Vector3d::UnitZ(), z_t, Eigen::Vector3d::UnitY());
+
+    correction_x = axc / a_px;
+    correction_y = ayc / a_py;
+    RCLCPP_INFO_STREAM(this->get_logger(), "correction_x: " << correction_x << "; correction_y: " << correction_y);
+  }
+  cv::Mat Mt = (cv::Mat_<double>(2,3) << 1, 0, correction_x, 0, 1, correction_y);
+
+  // https://stackoverflow.com/questions/75388906/how-to-rotate-and-translate-an-image-with-opencv-without-losing-off-screen-data
+  const auto M = chain_affine_transformation_mats(Mt, Mr);
+
+  RCLCPP_INFO_STREAM(this->get_logger(), "Mr: " << Mr);
+  RCLCPP_INFO_STREAM(this->get_logger(), "Mt: " << Mt);
+  RCLCPP_INFO_STREAM(this->get_logger(), "M: " << M);
   //Create the destination image
   cv::Mat stab(cv_ptr->image.size(), cv_ptr->image.type());
-  const auto center = cv::Point( cv_ptr->image.cols/2, cv_ptr->image.rows/2 );
-  const auto correction_angle = -180.0*a_r/M_PI; //Rotation angle is measured clockwise around axis, cv takes positive angle as anticlockwise
-  const auto M = cv::getRotationMatrix2D( center, correction_angle, 1.0 );
-
   cv::warpAffine(cv_ptr->image, stab, M, stab.size());
 
 
