@@ -6,7 +6,10 @@
 #include <image_geometry/pinhole_camera_model.h>
 
 #include <tf2_ros/transform_listener.h>
+#include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/buffer.h>
+
+#include <Eigen/Dense>
 
 namespace image_stabilizer_proc {
 
@@ -26,10 +29,18 @@ class Stabilizer : public rclcpp::Node
     bool _stabilize_translation;
     //Time constants for "spring to center"
     double _spring_tau_rotation;
-    double _spring_tau_translation;
+    double _spring_tau_jitter;
+    //Deadzone to "snap" close stabilization
+    double _deadzone_rotation;
+    double _deadzone_translation;
+
+    rclcpp::Time _last_frame;
+    Eigen::Quaterniond _last_rotation;
+    Eigen::Quaterniond _spring_correction;
 
     std::unique_ptr<tf2_ros::Buffer> _tf_buffer;
     std::shared_ptr<tf2_ros::TransformListener> _tf_listener;
+    std::shared_ptr<tf2_ros::TransformBroadcaster> _tf_broadcaster;
 
     // image_transport::ImageTransport _it;
     image_geometry::PinholeCameraModel _model;
